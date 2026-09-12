@@ -119,6 +119,10 @@ export const EVALUATION_INERT_CONFIG_KEYS: ReadonlySet<string> = new Set([
   // granularity: 'auto' on every inline alert it authors — refusing on it
   // would blank chartConfig for the most common authoring path.
   'granularity',
+  // Render-only: only controls the legend label in the UI, has no effect on
+  // alert evaluation. Classifying as lossy would block external PUT for any
+  // alert carrying a legend.
+  'legendTemplate',
 ]);
 
 /**
@@ -145,7 +149,6 @@ export const KNOWN_LOSSY_CONFIG_KEYS: ReadonlySet<string> = new Set([
   'metricTables',
   'promqlExpression',
   'step',
-  'legendTemplate',
 ]);
 
 /** Select-item fields the external dialect round-trips. */

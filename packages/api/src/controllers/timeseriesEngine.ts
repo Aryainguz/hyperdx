@@ -248,3 +248,42 @@ export async function queryLabelNames({
 
   return queryDistinctTagsValues({ ...args, value, conditions, limit });
 }
+
+/**
+ * Runs the prometheusQueryRange table function for a given ClickHouse connection.
+ */
+export async function queryPrometheusRangeFromClickHouse({
+  client,
+  databaseName,
+  tableName,
+  expr,
+  startMs,
+  endMs,
+  stepSec,
+}: {
+  client: ClickhouseClient;
+  databaseName: string;
+  tableName: string;
+  expr: string;
+  startMs: number;
+  endMs: number;
+  stepSec: number;
+}) {
+  return client.query({
+    query: `SELECT tags, time_series FROM prometheusQueryRange({db:String}, {table:String}, {expr:String}, fromUnixTimestamp64Milli({startMs:Int64}), fromUnixTimestamp64Milli({endMs:Int64}), toIntervalSecond({stepSec:UInt32})) SETTINGS allow_experimental_time_series_table = 1`,
+    query_params: {
+      db: databaseName,
+      table: tableName,
+      expr,
+      startMs,
+      endMs,
+      stepSec,
+    },
+    format: 'JSON',
+    clickhouse_settings: {
+      allow_experimental_time_series_table: 1,
+      max_execution_time: PROMETHEUS_MAX_EXECUTION_SEC,
+      max_result_rows: String(PROMETHEUS_MAX_RESULT_ROWS),
+    },
+  });
+}

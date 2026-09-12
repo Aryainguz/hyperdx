@@ -7,7 +7,6 @@ import {
   chSqlToAliasMap,
   ResponseJSON,
 } from '@hyperdx/common-utils/dist/clickhouse';
-import { ClickhouseClient } from '@hyperdx/common-utils/dist/clickhouse/node';
 import { tryOptimizeConfigWithMaterializedView } from '@hyperdx/common-utils/dist/core/materializedViews';
 import {
   getMetadata,
@@ -25,7 +24,6 @@ import {
 } from '@hyperdx/common-utils/dist/core/utils';
 import { timeBucketByGranularity } from '@hyperdx/common-utils/dist/core/utils';
 import { getDashboardVariableDeclarations } from '@hyperdx/common-utils/dist/filters';
-import { substitutePromqlChartConfigVariables } from '@hyperdx/common-utils/dist/variables';
 import {
   isBuilderChartConfig,
   isBuilderSavedChartConfig,
@@ -34,20 +32,21 @@ import {
   isRawSqlSavedChartConfig,
 } from '@hyperdx/common-utils/dist/guards';
 import {
-  ChartVariable,
   ALERT_NOTIFICATION_TARGETS_LIMIT,
   AlertErrorType,
   AlertNotificationTargetTiming,
   AlertThresholdType,
   BuilderChartConfigWithOptDateRange,
   ChartConfigWithOptDateRange,
+  ChartVariable,
   DisplayType,
   getSampleWeightExpression,
   pickSampleWeightExpressionProps,
-  SavedChartConfig,
   PromqlSavedChartConfig,
+  SavedChartConfig,
   SourceKind,
 } from '@hyperdx/common-utils/dist/types';
+import { substitutePromqlChartConfigVariables } from '@hyperdx/common-utils/dist/variables';
 import * as fns from 'date-fns';
 import { isString, pick } from 'lodash';
 import { ObjectId } from 'mongoose';
@@ -56,8 +55,10 @@ import ms from 'ms';
 import { performance } from 'perf_hooks';
 import { serializeError } from 'serialize-error';
 
+import { ClickhouseClient } from '@/clickhouse';
 import { ALERT_HISTORY_QUERY_CONCURRENCY } from '@/controllers/alertHistory';
 import { getConnectionById } from '@/controllers/connection';
+import { queryPrometheusRangeFromClickHouse } from '@/controllers/timeseriesEngine';
 import { AlertState, IAlert, IAlertError } from '@/models/alert';
 import AlertHistory, {
   IAlertHistory,
@@ -67,7 +68,10 @@ import { IDashboard } from '@/models/dashboard';
 import { ISavedSearch } from '@/models/savedSearch';
 import { ISource } from '@/models/source';
 import { IWebhook } from '@/models/webhook';
-import { joinPrometheusUpstreamUrl } from '@/routers/api/prometheus';
+import {
+  joinPrometheusUpstreamUrl,
+  PROMETHEUS_CH_TIMEOUT_MS,
+} from '@/routers/api/prometheus';
 import {
   isClientTimeoutOrAbortError,
   isQueryTimeoutError,
@@ -232,12 +236,12 @@ class InvalidAlertError extends Error {
 // from upstream systems. QUERY_ERROR and INVALID_ALERT messages are authored
 // by us (ClickHouse errors or our own validation) and are safe to display.
 const HARDCODED_ALERT_ERROR_MESSAGES: Partial<Record<AlertErrorType, string>> =
-{
-  [AlertErrorType.WEBHOOK_ERROR]:
-    'Failed to send webhook notification. Check the webhook configuration and destination.',
-  [AlertErrorType.UNKNOWN]:
-    'An unknown error occurred while processing the alert.',
-};
+  {
+    [AlertErrorType.WEBHOOK_ERROR]:
+      'Failed to send webhook notification. Check the webhook configuration and destination.',
+    [AlertErrorType.UNKNOWN]:
+      'An unknown error occurred while processing the alert.',
+  };
 
 const makeAlertError = (
   type: AlertErrorType,
@@ -889,14 +893,14 @@ const getChartConfigFromAlert = (
 
 type ResponseMetadata =
   | {
-    type: 'time_series';
-    timestampColumnName: string;
-    valueColumnNames: Set<string>;
-  }
+      type: 'time_series';
+      timestampColumnName: string;
+      valueColumnNames: Set<string>;
+    }
   | {
-    type: 'single_value';
-    valueColumnNames: Set<string>;
-  };
+      type: 'single_value';
+      valueColumnNames: Set<string>;
+    };
 
 const getResponseMetadata = (
   chartConfig: ChartConfigWithOptDateRange,
@@ -1005,9 +1009,11 @@ export async function evaluatePromqlAlert({
   const endSec = dateRange[1].getTime() / 1000;
   const startSec = dateRange[0].getTime() / 1000;
   const stepSec = windowSizeInMins * 60;
-  const promqlExpression = variables && variables.length > 0
-    ? substitutePromqlChartConfigVariables({ ...savedConfig, variables }).promqlExpression
-    : savedConfig.promqlExpression;
+  const promqlExpression =
+    variables && variables.length > 0
+      ? substitutePromqlChartConfigVariables({ ...savedConfig, variables })
+          .promqlExpression
+      : savedConfig.promqlExpression;
 
   if (connection.isPrometheusEndpoint) {
     // Proxy to the real Prometheus /api/v1/query_range
@@ -1034,9 +1040,19 @@ export async function evaluatePromqlAlert({
     }
     const json = (await resp.json()) as {
       status?: string;
-      data?: { result?: { metric?: Record<string, string>; values?: [number, string][] }[] };
+      data?: {
+        result?: {
+          metric?: Record<string, string>;
+          values?: [number, string][];
+        }[];
+      };
     };
-    if (json?.status !== 'success' || !Array.isArray(json?.data?.result)) {
+    if (json?.status !== 'success') {
+      throw new Error(
+        `Prometheus query_range returned status '${json?.status}' for PromQL alert`,
+      );
+    }
+    if (!Array.isArray(json?.data?.result)) {
       return null;
     }
 
@@ -1050,9 +1066,9 @@ export async function evaluatePromqlAlert({
         // Format Prometheus metric object as a HyperDX group key: key1:"val1", key2:"val2"
         const group = series.metric
           ? Object.entries(series.metric)
-            .filter(([k]) => k !== '__name__')
-            .map(([k, v]) => `${k}:"${v}"`)
-            .join(', ')
+              .filter(([k]) => k !== '__name__')
+              .map(([k, v]) => `${k}:"${v}"`)
+              .join(', ')
           : '';
         results.push({ group, value: parsed });
       }
@@ -1060,34 +1076,29 @@ export async function evaluatePromqlAlert({
     return results.length > 0 ? results : null;
   }
 
-  // ClickHouse prometheusQueryRange path
+  // ClickHouse prometheusQueryRange path — use the API ClickhouseClient so
+  // request-scoped logger/telemetry wiring is included.
   const client = new ClickhouseClient({
     host: connection.host,
     username: connection.username,
     password: connection.password,
-    requestTimeout: 30_000,
+    requestTimeout: PROMETHEUS_CH_TIMEOUT_MS,
   });
 
   const startMs = Math.floor(startSec * 1000);
   const endMs = Math.floor(endSec * 1000);
+  const stepSecRounded = Math.max(Math.floor(stepSec), 1);
 
-  const resp = await client.query({
-    query: `SELECT tags, time_series FROM prometheusQueryRange({db:String}, {table:String}, {expr:String}, fromUnixTimestamp64Milli({startMs:Int64}), fromUnixTimestamp64Milli({endMs:Int64}), toIntervalSecond({stepSec:UInt32})) SETTINGS allow_experimental_time_series_table = 1`,
-    query_params: {
-      // ISource always has `from` (it is on BaseSourceSchema); the nullable
-      // source param covers the case where no source is wired to the alert.
-      db: source?.from.databaseName ?? 'default',
-      table: source?.from.tableName ?? 'otel_metrics_gauge',
-      expr: promqlExpression,
-      startMs,
-      endMs,
-      stepSec,
-    },
-    format: 'JSON',
-    clickhouse_settings: {
-      allow_experimental_time_series_table: 1,
-      max_execution_time: 30,
-    },
+  const resp = await queryPrometheusRangeFromClickHouse({
+    client,
+    // ISource always has `from` (it is on BaseSourceSchema); the nullable
+    // source param covers the case where no source is wired to the alert.
+    databaseName: source?.from.databaseName ?? 'default',
+    tableName: source?.from.tableName ?? 'otel_metrics_gauge',
+    expr: promqlExpression,
+    startMs,
+    endMs,
+    stepSec: stepSecRounded,
   });
 
   const json = await resp.json<any>();
@@ -1099,10 +1110,10 @@ export async function evaluatePromqlAlert({
     const lastPoint = series.time_series[series.time_series.length - 1];
     if (lastPoint != null && Number.isFinite(lastPoint[1])) {
       const group = series.tags
-        ? Object.entries(series.tags)
-          .filter(([k]) => k !== '__name__')
-          .map(([k, v]) => `${k}:"${v}"`)
-          .join(', ')
+        ? series.tags
+            .filter(([k]: any) => k !== '__name__')
+            .map(([k, v]: any) => `${k}:"${v}"`)
+            .join(', ')
         : '';
       results.push({ group, value: lastPoint[1] });
     }
@@ -1427,7 +1438,6 @@ export const processAlert = async (
       }
     };
 
-
     const isPromQL =
       details.taskType === AlertTaskType.INLINE
         ? isPromqlSavedChartConfig(details.chartConfig)
@@ -1454,11 +1464,11 @@ export const processAlert = async (
           variables:
             details.taskType === AlertTaskType.TILE
               ? getDashboardVariableDeclarations(details.dashboard.filters).map(
-                declaration => ({
-                  ...declaration,
-                  values: [],
-                }),
-              )
+                  declaration => ({
+                    ...declaration,
+                    values: [],
+                  }),
+                )
               : undefined,
         });
 
@@ -1469,7 +1479,9 @@ export const processAlert = async (
 
             const history = getOrCreateHistory(groupKey);
             history.lastValues.push({ count: value, startTime: dateRange[1] });
-            const previous = previousMap.get(computeHistoryMapKey(alert.id, groupKey));
+            const previous = previousMap.get(
+              computeHistoryMapKey(alert.id, groupKey),
+            );
 
             if (doesExceedThreshold(alert, value)) {
               history.counts += 1;
@@ -1492,11 +1504,36 @@ export const processAlert = async (
           }
         }
       } catch (e) {
-        logger.error(
-          { alertId: alert.id, err: e },
-          'Failed to evaluate PromQL alert',
-        );
+        const queryDurationMs = performance.now() - evalStartedAt;
+        evaluationAnalytics.queryDurationMs = Math.round(queryDurationMs);
+        recordOperationOutcome({
+          operation: 'alerts.query',
+          outcome: 'error',
+          durationMs: queryDurationMs,
+          attributes: { alert_source: alert.source ?? 'unknown' },
+        });
         evalOutcome = 'error';
+        const alertError = makeQueryAlertError(e, PROMETHEUS_CH_TIMEOUT_MS);
+        alertQueryFailuresCounter.add(1, {
+          error_type:
+            alertError.type === AlertErrorType.QUERY_TIMEOUT
+              ? 'timeout'
+              : 'error',
+        });
+        logger.error(
+          {
+            alertId: alert.id,
+            errorType: alertError.type,
+            error: serializeError(e),
+          },
+          'PromQL alert query failed, skipping state/history update',
+        );
+        await alertProvider.recordAlertErrors(
+          alert.id,
+          [alertError],
+          nowInMinsRoundDown,
+          evaluationAnalytics,
+        );
         return;
       }
 
@@ -1512,7 +1549,11 @@ export const processAlert = async (
           ) {
             const history = getOrCreateHistory(groupKey);
             history.lastValues.push({ count: 0, startTime: dateRange[1] });
-            await sendNotificationIfResolved(previousHistory, history, groupKey);
+            await sendNotificationIfResolved(
+              previousHistory,
+              history,
+              groupKey,
+            );
           }
         }
       }
@@ -1555,7 +1596,6 @@ export const processAlert = async (
       return;
     }
 
-
     // For saved search alerts, the WHERE clause may reference aliased columns
     // from the saved search's select expression (e.g. `toString(Body) AS body`).
     // The alert query itself uses count(*), not the saved search's select,
@@ -1596,12 +1636,12 @@ export const processAlert = async (
     const optimizedChartConfig =
       isBuilderChartConfig(chartConfig) && mvSource?.materializedViews?.length
         ? await tryOptimizeConfigWithMaterializedView(
-          chartConfig,
-          metadata,
-          clickhouseClient,
-          undefined,
-          mvSource,
-        )
+            chartConfig,
+            metadata,
+            clickhouseClient,
+            undefined,
+            mvSource,
+          )
         : chartConfig;
 
     // Readonly = 2 means the query is readonly but can still specify query settings.
@@ -2162,7 +2202,7 @@ export const getConsecutiveWindowHistories = async (
         const windowStart = getAlertWindowStart(alert, now);
         const earliestAllowedTime = new Date(
           windowStart.getTime() -
-          (numWindowsToLookBack - 1) * windowSizeInMins * 60_000,
+            (numWindowsToLookBack - 1) * windowSizeInMins * 60_000,
         );
         const id = new mongoose.Types.ObjectId(alert.id);
         const histories = await AlertHistory.aggregate<AggregatedAlertHistory>([

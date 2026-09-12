@@ -1,11 +1,12 @@
-import { ClickhouseClient } from '@hyperdx/common-utils/dist/clickhouse/node';
 import mongoose from 'mongoose';
 
 import { getConnectionById } from '@/controllers/connection';
+import { queryPrometheusRangeFromClickHouse } from '@/controllers/timeseriesEngine';
 import { evaluatePromqlAlert } from '@/tasks/checkAlerts';
 
 jest.mock('@/controllers/connection');
-jest.mock('@hyperdx/common-utils/dist/clickhouse/node');
+jest.mock('@/controllers/timeseriesEngine');
+jest.mock('@/clickhouse');
 
 describe('evaluatePromqlAlert', () => {
   const mockTeamId = new mongoose.Types.ObjectId().toString();
@@ -70,7 +71,6 @@ describe('evaluatePromqlAlert', () => {
       );
     });
 
-
     it('should return multiple series for Prometheus endpoint', async () => {
       (global.fetch as jest.Mock).mockResolvedValue({
         ok: true,
@@ -105,9 +105,30 @@ describe('evaluatePromqlAlert', () => {
       ]);
     });
 
+    it('should throw on non-success Prometheus status instead of returning null', async () => {
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          status: 'error',
+          error: 'query timeout',
+          data: { result: [] },
+        }),
+      });
 
+      await expect(
+        evaluatePromqlAlert({
+          savedConfig: mockSavedConfig,
+          connectionId: mockConnectionId,
+          teamId: mockTeamId,
+          dateRange: mockDateRange,
+          windowSizeInMins: mockWindowSizeInMins,
+        }),
+      ).rejects.toThrow(
+        "Prometheus query_range returned status 'error' for PromQL alert",
+      );
+    });
 
-    it('should return null when no data is returned', async () => {
+    it('should return null when result array is empty', async () => {
       (global.fetch as jest.Mock).mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -129,30 +150,26 @@ describe('evaluatePromqlAlert', () => {
   });
 
   describe('ClickHouse endpoint', () => {
-    let mockQuery: jest.Mock;
-
     beforeEach(() => {
       (getConnectionById as jest.Mock).mockResolvedValue({
         host: 'http://clickhouse:8123',
+        username: 'default',
+        password: '',
         isPrometheusEndpoint: false,
       });
-
-      mockQuery = jest.fn();
-      (ClickhouseClient as unknown as jest.Mock).mockImplementation(() => ({
-        query: mockQuery,
-      }));
     });
 
-    it('should return multiple series for ClickHouse endpoint with proper db/table', async () => {
-      mockQuery.mockResolvedValue({
+    it('should return multiple series with tags as tuples', async () => {
+      // tags is an array of [key, value] tuples — as returned by ClickHouse
+      (queryPrometheusRangeFromClickHouse as jest.Mock).mockResolvedValue({
         json: async () => ({
           data: [
             {
-              tags: { host: 'A' },
+              tags: [['host', 'A']],
               time_series: [['2024-01-01 00:05:00', 42.5]],
             },
             {
-              tags: { host: 'B' },
+              tags: [['host', 'B']],
               time_series: [['2024-01-01 00:05:00', 10.5]],
             },
           ],
@@ -161,7 +178,9 @@ describe('evaluatePromqlAlert', () => {
 
       const result = await evaluatePromqlAlert({
         savedConfig: mockSavedConfig,
-        source: { from: { databaseName: 'my_db', tableName: 'my_table' } } as any,
+        source: {
+          from: { databaseName: 'my_db', tableName: 'my_table' },
+        } as any,
         connectionId: mockConnectionId,
         teamId: mockTeamId,
         dateRange: mockDateRange,
@@ -173,19 +192,44 @@ describe('evaluatePromqlAlert', () => {
         { group: 'host:"B"', value: 10.5 },
       ]);
 
-      expect(mockQuery).toHaveBeenCalledWith(
+      expect(queryPrometheusRangeFromClickHouse).toHaveBeenCalledWith(
         expect.objectContaining({
-          query_params: expect.objectContaining({
-            expr: 'up',
-            db: 'my_db',
-            table: 'my_table',
-          }),
+          expr: 'up',
+          databaseName: 'my_db',
+          tableName: 'my_table',
         }),
       );
     });
 
-    it('should query ClickHouse and return the last value', async () => {
-      mockQuery.mockResolvedValue({
+    it('should filter __name__ from tags tuples', async () => {
+      (queryPrometheusRangeFromClickHouse as jest.Mock).mockResolvedValue({
+        json: async () => ({
+          data: [
+            {
+              tags: [
+                ['__name__', 'up'],
+                ['host', 'A'],
+              ],
+              time_series: [['2024-01-01 00:05:00', 42.5]],
+            },
+          ],
+        }),
+      });
+
+      const result = await evaluatePromqlAlert({
+        savedConfig: mockSavedConfig,
+        connectionId: mockConnectionId,
+        teamId: mockTeamId,
+        dateRange: mockDateRange,
+        windowSizeInMins: mockWindowSizeInMins,
+      });
+
+      // __name__ is stripped
+      expect(result).toEqual([{ group: 'host:"A"', value: 42.5 }]);
+    });
+
+    it('should use defaults when no source is provided', async () => {
+      (queryPrometheusRangeFromClickHouse as jest.Mock).mockResolvedValue({
         json: async () => ({
           data: [
             {
@@ -207,20 +251,19 @@ describe('evaluatePromqlAlert', () => {
       });
 
       expect(result).toEqual([{ group: '', value: 42.5 }]);
-      expect(mockQuery).toHaveBeenCalledWith(
+      expect(queryPrometheusRangeFromClickHouse).toHaveBeenCalledWith(
         expect.objectContaining({
-          query_params: expect.objectContaining({
-            expr: 'up',
-            startMs: 1704067200000,
-            endMs: 1704067500000,
-            stepSec: 300,
-          }),
+          databaseName: 'default',
+          tableName: 'otel_metrics_gauge',
+          startMs: 1704067200000,
+          endMs: 1704067500000,
+          stepSec: 300,
         }),
       );
     });
 
     it('should return null when no data is returned', async () => {
-      mockQuery.mockResolvedValue({
+      (queryPrometheusRangeFromClickHouse as jest.Mock).mockResolvedValue({
         json: async () => ({
           data: [],
         }),

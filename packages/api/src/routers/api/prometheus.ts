@@ -11,6 +11,7 @@ import {
   PROMETHEUS_MAX_RESULT_ROWS,
   queryLabelNames,
   queryLabelValues,
+  queryPrometheusRangeFromClickHouse,
   TimeSeriesTagsQueryArgs,
 } from '@/controllers/timeseriesEngine';
 import { getNonNullUserWithTeam } from '@/middleware/auth';
@@ -160,7 +161,7 @@ export function formatVectorResponse(
 // --------------------------
 
 const PROMETHEUS_PROXY_TIMEOUT_MS = 90_000;
-const PROMETHEUS_CH_TIMEOUT_MS = 30_000;
+export const PROMETHEUS_CH_TIMEOUT_MS = 30_000;
 const PROMETHEUS_MAX_RESOLUTION = 11_000;
 // Widest window /query_exemplars will proxy. Prometheus's exemplar store is a
 // small circular buffer, so a wider range mostly costs a bigger streamed body
@@ -499,22 +500,14 @@ const queryRangeHandler: express.RequestHandler = async (req, res) => {
     const endMs = Math.floor(end * 1000);
     const stepSec = Math.max(Math.floor(step), 1);
 
-    const resp = await client.query({
-      query: `SELECT tags, time_series FROM prometheusQueryRange({db:String}, {table:String}, {expr:String}, fromUnixTimestamp64Milli({startMs:Int64}), fromUnixTimestamp64Milli({endMs:Int64}), toIntervalSecond({stepSec:UInt32})) SETTINGS allow_experimental_time_series_table = 1`,
-      query_params: {
-        db: database,
-        table,
-        expr: query,
-        startMs,
-        endMs,
-        stepSec,
-      },
-      format: 'JSON',
-      clickhouse_settings: {
-        allow_experimental_time_series_table: 1,
-        max_execution_time: PROMETHEUS_MAX_EXECUTION_SEC,
-        max_result_rows: String(PROMETHEUS_MAX_RESULT_ROWS),
-      },
+    const resp = await queryPrometheusRangeFromClickHouse({
+      client,
+      databaseName: database,
+      tableName: table,
+      expr: query,
+      startMs,
+      endMs,
+      stepSec,
     });
 
     const json = await resp.json<any>();
