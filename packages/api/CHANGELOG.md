@@ -1,5 +1,62 @@
 # @hyperdx/api
 
+## 2.39.0
+
+### Minor Changes
+
+- ff1e77ce: Backfill alert `displayName` and `tags` from the referenced saved search or dashboard on API startup. Alerts that already have a display name or tags are skipped.
+- f007c37f: Add a context-aware getting-started checklist to the sidebar for recently-created teams. After the setup steps (connect ClickHouse, add data) complete, a second phase tracks product-usage milestones persisted per user on `user.onboardingData`: exploring data, building a dashboard, setting up an alert, and using the MCP server. Completion is recorded server-side so it counts from the UI, the external REST API v2, or an MCP tool; the card can be dismissed and reappears if a new task is added to the registry.
+- 972634d2: Report the whole alert condition in the `{{sourceQuery}}` webhook template
+  variable. It read only a chart's top-level `where`, so an alert defined by a
+  per-series `aggCondition` — a common shape — still rendered empty. The variable
+  now reports every part of the condition the alert query actually applies: a
+  chart's `where` plus the `aggCondition` of the series the alert reads, and a
+  saved search's `where` plus its pinned filters. A chart's pinned filters are
+  deliberately excluded, since a tile or inline alert does not apply them. The
+  value is truncated at 2000 characters.
+
+  Editing an alert off a `between` or `outside` comparator now clears the stored
+  `thresholdMax` instead of leaving the old bound on the document, where it was
+  also served by the alerts APIs and would advertise a range that no longer
+  fires. Webhook templates already guarded against this on read.
+
+  The webhook form's variable list and the API's fallback body template both
+  derive from one list in common-utils, which `buildWebhookTemplateVariables` is
+  typed against, so a variable cannot be added without appearing in both places.
+  The "Send test" payload carries a sample value for every variable, so a body
+  template can be checked before an alert fires.
+
+  The documented guard for an optional number is now
+  `{{#unless (eq thresholdMax undefined)}}` rather than `{{#if thresholdMax}}`,
+  which treats a legitimate bound of `0` as absent.
+
+### Patch Changes
+
+- 4d18cb09: fix: fetch a grouped alert's example log lines once per window
+
+  A saved-search alert puts a handful of example log lines into the notification it sends, and fetching them takes a second query. That query was being made while building each message, so an alert grouped by service asked ClickHouse for the same lines once per breaching service — ten services meant ten identical queries over the same data, because the query only filters by the saved search and the time window, never by the group. It now runs once and every notification for that window shares the answer. An alert catching up on skipped ticks still fetches lines for each window it backfills, since those genuinely differ. Ungrouped alerts are unaffected; they only ever asked once.
+
+- c8cc8e5e: feat: Include alert tags in the tags API response
+- 84c67f4b: fix: show only the delivery time in an alert's notification duration
+
+  The notification duration on an alert's evaluation list was timing everything an alert does once it decides to fire: building the message title and links, querying the log lines that go in the body, rendering the template, and then delivering it. That made the column read in seconds while the webhook underneath it answered in milliseconds — the column and its own per-target breakdown disagreed, and the figure was dominated by work that has nothing to do with how fast the notification target responded. It now times the delivery alone. Evaluations already recorded keep their old figure and will read high.
+
+- cfacdbe5: feat: relative date ranges for dashboards can now be saved
+- 78a33ba4: feat: Allow configuring dashboard filters as required
+- edb693a6: Apply saved-search pinned filters to alert notification sample queries so sample
+  log lines come from the same row set the alert counted.
+- 0a371980: fix: Keep `/api/sources` responses stable for sources whose stored `metadataMaterializedViews` has no nested `_id`
+- 6c85ca02: feat: add a pluggable token encryption service for stored third-party tokens. Set `TOKEN_ENCRYPTION_KEY` to a 32-byte key (base64 or hex) to encrypt them with AES-256-GCM; without it they are stored unencrypted.
+- Updated dependencies [96ac6b1b]
+- Updated dependencies [84c67f4b]
+- Updated dependencies [f007c37f]
+- Updated dependencies [cfacdbe5]
+- Updated dependencies [78a33ba4]
+- Updated dependencies [3876d6b9]
+- Updated dependencies [b4840573]
+- Updated dependencies [972634d2]
+  - @hyperdx/common-utils@0.29.0
+
 ## 2.38.0
 
 ### Minor Changes
