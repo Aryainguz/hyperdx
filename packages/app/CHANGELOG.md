@@ -1,5 +1,52 @@
 # @hyperdx/app
 
+## 2.40.0
+
+### Minor Changes
+
+- 08d9a908: feat: Plot several PromQL expressions on one chart
+- d9e2c58b: Add a per-source floor for auto granularity. A metric source can now set "Minimum auto granularity" (Team Settings → Sources → your Metrics source) so that auto-inferred time buckets never go below it — useful when the underlying metric is reported on a fixed interval (e.g. a 60s scrape), since a short selected date range can otherwise auto-infer a smaller bucket than that interval and render a sparse/steppy series (alternating real-sample/empty buckets). Mirrors Grafana's per-datasource "Min interval" setting. Unset (the default) preserves the existing unfloored behavior, and an explicit (non-auto) granularity chosen on a tile is never affected.
+- d76cb7ed: Add a "Trace logs" tab to the event side panel, listing the trace's logs as a flat chronological table over the same time window the waterfall uses. It appears on any row that carries a trace id and resolves a log source — a span (via the trace source's correlated log source) or a log (its own source). Previously the only route to a trace's logs was hunting for the green rows interleaved in the waterfall, which a log-heavy trace buries.
+
+  The tab lists the trace unfiltered; "Open in search" hands the same query — same source, same trace, same window — to the search page for anything narrower. Picking a log opens it in the panel: a breadcrumb hop from a span, or a row change from another log. Sorting is ascending, which inside a trace is execution order.
+
+### Patch Changes
+
+- 416c92a0: fix: stop discarding chart axis-tick decimals for large numbers
+
+  Axis ticks at or above 1k were always rounded to a whole number regardless of the configured Number Format, so nearby values (e.g. 950 and 1080) could both render as `1k` — ticks now use as much precision as the axis's width allows, on both the web app and CLI terminal charts. Also fixed: a tightly fit Y-axis could show two ticks with the identical rounded label.
+
+- 4fa3c376: Fix search results going blank after expanding and collapsing rows. A row and
+  its inline expansion are two `tr`s sharing one virtual index, and both were
+  measured by the virtualizer, so the expanded row took over that index's
+  ResizeObserver registration and left its height cached there after it
+  collapsed. Each expand/collapse shrank the render window a little further until
+  scrolling showed only a handful of rows above empty space. The row and its
+  expansion are now wrapped in a `tbody` that is measured as one unit.
+- a8a72c11: fix: Support instant queries and reductions on PromQL number tiles
+- 4c4792f5: fix: drop the search bar WHERE label and `/` keycap overlay
+
+  The `WHERE` label repeated the SQL placeholder, and the `/` hint clipped long queries. `/` and `s` still focus the input; the overlay is gone.
+
+- c2c26093: feat: reveal search row-selection checkboxes on hover
+
+  The multi-select checkbox now fades in when a row is hovered or the checkbox
+  takes keyboard focus, instead of sitting on every row all the time, and is a
+  little smaller so its column costs less horizontal room. Selecting
+  any row reveals every checkbox so shift-click ranges stay aimable, and touch
+  devices (no hover) keep them visible. The cell keeps its width in every state,
+  so nothing reflows on hover.
+
+- 16c7a6c3: fix: keep toolbar controls level with the first line of a wrapping query field
+
+  Date pickers, Run, and nearby row actions stay top-aligned as a SQL or Lucene field grows. Sessions opts into PageHeader block padding so a taller search bar still has room.
+
+- Updated dependencies [08d9a908]
+- Updated dependencies [a8a72c11]
+- Updated dependencies [d9e2c58b]
+  - @hyperdx/common-utils@0.30.0
+  - @hyperdx/api@2.40.0
+
 ## 2.39.1
 
 ### Patch Changes
