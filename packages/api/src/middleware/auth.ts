@@ -87,6 +87,25 @@ export function getAccessKeyFromRequest(req: Request): string | undefined {
   return req.headers.authorization?.split('Bearer ')[1];
 }
 
+const accessKeyLookups = new WeakMap<Request, Promise<UserDocument | null>>();
+
+/**
+ * The user for the request's bearer key, or null. Looked up once per request:
+ * the body parser can check the key before validateUserAccessKey does.
+ */
+export function findAccessKeyUser(req: Request): Promise<UserDocument | null> {
+  const key = getAccessKeyFromRequest(req);
+  if (!key) {
+    return Promise.resolve(null);
+  }
+  let lookup = accessKeyLookups.get(req);
+  if (lookup == null) {
+    lookup = Promise.resolve(findUserByAccessKey(key));
+    accessKeyLookups.set(req, lookup);
+  }
+  return lookup;
+}
+
 export async function validateUserAccessKey(
   req: Request,
   res: Response,
@@ -100,7 +119,7 @@ export async function validateUserAccessKey(
   // Express 4 drops rejected promises from middleware, which would leave the
   // request hanging on a database error.
   try {
-    const user = await findUserByAccessKey(key);
+    const user = await findAccessKeyUser(req);
     if (!user) {
       if (key.startsWith(ORG_API_KEY_PREFIX)) {
         orgApiKeyAuthFailures.add(1);

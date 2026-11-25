@@ -7,6 +7,7 @@ import onHeaders from 'on-headers';
 import * as config from './config';
 import mcpRouter from './mcp/app';
 import { isUserAuthenticated } from './middleware/auth';
+import { parseRequestBody } from './middleware/bodyParser';
 import defaultCors from './middleware/cors';
 import { appErrorHandler } from './middleware/error';
 import routers from './routers/api';
@@ -22,7 +23,6 @@ import usageStats from './tasks/usageStats';
 import { registerAITelemetry } from './utils/aiTelemetry';
 import logger, { expressLogger } from './utils/logger';
 import passport from './utils/passport';
-import { captureProxyBody } from './utils/proxyBody';
 
 registerAITelemetry();
 
@@ -57,21 +57,13 @@ if (!config.IS_CI && config.FRONTEND_URL) {
 
 app.disable('x-powered-by');
 app.use(compression());
-app.use(express.json({ limit: '32mb', verify: captureProxyBody }));
-app.use(express.text({ limit: '32mb', verify: captureProxyBody }));
-app.use(
-  express.urlencoded({
-    extended: false,
-    limit: '32mb',
-    verify: captureProxyBody,
-  }),
-);
 app.use(session(sess));
 
 if (!config.IS_LOCAL_APP_MODE) {
   app.use(passport.initialize());
   app.use(passport.session());
 }
+app.use(parseRequestBody);
 
 if (!config.IS_CI) {
   app.use(expressLogger);
